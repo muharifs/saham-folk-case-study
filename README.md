@@ -243,6 +243,106 @@ def course_checkout(request):
         status=status.HTTP_200_OK,
     )
 
+class MidtransWebhookAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        payload = request.data
+
+        if not self._is_signature_valid(payload):
+            return Response(
+                {'error': 'Invalid signature key. Unauthorized request.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            self._process_transaction(payload)
+            return Response({'status': 'success'}, status=status.HTTP_200_OK)
+
+        except Order.DoesNotExist:
+            return Response({'error': 'Order ID not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Payment.DoesNotExist:
+            return Response({'error': 'Payment record not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception:
+            # The caller is unauthenticated: log the detail, return nothing.
+            logger.exception("Midtrans webhook failed for payload %s", payload.get('order_id'))
+            return Response(
+                {'error': 'Internal error.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _is_signature_valid(self, payload) -> bool:
+        """Verify that the webhook really came from Midtrans."""
+        order_id = payload.get('order_id', '')
+        status_code = payload.get('status_code', '')
+        gross_amount = payload.get('gross_amount', '')
+        received_signature = payload.get('signature_key', '')
+
+        signature_string = f"{order_id}{status_code}{gross_amount}{settings.MIDTRANS_SERVER_KEY}"
+        calculated_signature = hashlib.sha512(signature_string.encode('utf-8')).hexdigest()
+
+        # Constant-time: a plain == leaks how much of the digest matched.
+        return hmac.compare_digest(str(received_signature), calculated_signature)
+
+    @transaction.atomic
+    def _process_transaction(self, payload):
+        """Apply the payment result to the Order, Payment and Enrollment rows."""
+
+        order_id = payload.get('order_id')
+        transaction_status = payload.get('transaction_status')
+        payment_type = payload.get('payment_type', '')
+        transaction_id = payload.get('transaction_id')
+        paid_at = payload.get('transaction_time')
+        raw_response = payload
+
+        order = Order.objects.select_for_update().get(order_id_midtrans=order_id)
+        payment = Payment.objects.select_for_update().get(order=order)
+
+        if transaction_status in ['settlement', 'capture']:
+            order.status = 'PAID'
+            payment.transaction_status = 'SUCCESS'
+            payment.payment_type = payment_type
+            payment.transaction_id = transaction_id
+            payment.paid_at = parse_midtrans_time(paid_at)
+            payment.raw_response = raw_response
+
+            if order.order_type == 'subscription':
+                transaction.on_commit(
+                    lambda: self._activate_subscription(order.id, raw_response, payment_type)
+                )
+            else:
+                transaction.on_commit(
+                    lambda: self._generate_invoice_and_enrollment(order.id, raw_response, payment_type)
+                )
+
+        elif transaction_status == 'pending':
+            self._handle_pending_payment(order, payment)
+
+        elif transaction_status in ['deny', 'cancel', 'expire']:
+            self._handle_failed_payment(order, payment)
+
+        order.save()
+        payment.save()
+
+    def _generate_invoice_and_enrollment(self, order_id, raw_response, payment_type):
+        generate_invoice_and_enrollment(order_id, raw_response, payment_type)
+
+    def _activate_subscription(self, order_id, raw_response, payment_type):
+        activate_subscription_for_order(order_id, raw_response, payment_type)
+
+    def _handle_pending_payment(self, order, payment):
+        order.status = 'PENDING'
+        payment.transaction_status = 'PENDING'
+
+    def _handle_failed_payment(self, order, payment):
+        order.status = 'FAILED'
+        payment.transaction_status = 'FAILED'
+        if order.order_type == 'subscription':
+            # A subscription that was never paid must not linger as "pending".
+            Subscription.objects.filter(order=order, status='pending').update(
+                status='cancelled'
+            )
+
 class InvoiceViewSet(ReadOnlyModelViewSet):
 """A buyer's own invoices. Read-only: invoices are issued by the payment
 flow, never edited or deleted over the API."""
